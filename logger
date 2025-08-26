@@ -1,0 +1,1462 @@
+"""
+Agilent MSO6034A Oscilloscope Interactive Test Driver
+
+This script provides an interactive interface to test all functions of the 
+AgilentCollect.py module for the Agilent MSO6034A Mixed Signal Oscilloscope.
+
+Features tested:
+- Connection and identification
+- Channel configuration
+- Timebase settings
+- Trigger configuration
+- Data acquisition
+- Measurements
+- System status
+- Error handling
+
+Usage:
+    python agilent_test_driver.py
+
+Requirements:
+    - AgilentCollect.py module
+    - pyvisa library
+    - numpy library
+    - matplotlib (optional, for plotting)
+
+Author: Automation Testing Scripts
+Date: July 25, 2025
+Version: 1.0
+Status: Stable
+"""
+
+import sys
+import os
+import time
+import traceback
+import numpy as np
+import csv
+from datetime import datetime
+from typing import Dict, List, Any, Optional, Tuple
+
+# Add the current directory to Python path to import AgilentCollect
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+try:
+    import pyvisa
+    from AgilentCollect import AgilentMSO6034A
+except ImportError as e:
+    print(f"Error importing required modules: {e}")
+    print("Please ensure AgilentCollect.py is in the same directory and pyvisa/numpy are installed")
+    sys.exit(1)
+
+# Try to import matplotlib for plotting (optional)
+plt = None
+try:
+    import matplotlib.pyplot as plt
+    MATPLOTLIB_AVAILABLE = True
+except ImportError:
+    MATPLOTLIB_AVAILABLE = False
+    print("Note: matplotlib not available - plotting functions disabled")
+
+
+class AgilentTestDriver:
+    """Interactive test driver for Agilent MSO6034A oscilloscope"""
+    
+    # Class attributes for type inference
+    scope: AgilentMSO6034A
+    connected: bool
+    def __init__(self, resource_string: str = ""):
+        # Initialize test driver
+        self.resource_string = resource_string
+        self.scope = AgilentMSO6034A(resource_string) if resource_string else AgilentMSO6034A()
+        self.connected = False
+        self.available_resources: List[Tuple[str, str]] = []  # List of (resource, identity) tuples
+        
+    def discover_oscilloscopes(self) -> List[Tuple[str, str]]:
+        """
+        Discover all available oscilloscopes
+        
+        Returns:
+            List of (resource_string, identification) tuples
+        """
+        self.print_header("OSCILLOSCOPE DISCOVERY")
+        
+        try:
+            # Use the same backend-aware resource manager from our scope instance
+            if hasattr(self.scope, 'rm') and self.scope.rm is not None:
+                rm = self.scope.rm
+                print("Using existing VISA backend from scope instance")
+            else:
+                # Fallback: try backends in order of preference
+                try:
+                    rm = pyvisa.ResourceManager()
+                    print("Using default VISA backend")
+                except Exception as e:
+                    print(f"Warning: Default VISA backend failed ({e})")
+                    print("Attempting to use PyVISA-py backend...")
+                    rm = pyvisa.ResourceManager('@py')
+                    print("Successfully initialized PyVISA-py backend")
+            
+            resources = rm.list_resources()
+            
+            if not resources:
+                print("✗ No VISA resources found!")
+                print("\nTroubleshooting:")
+                print("1. Check oscilloscope is powered on")
+                print("2. Check USB/LAN/GPIB connection")
+                print("3. Install Agilent IO Libraries Suite")
+                return []
+            
+            print(f"Found {len(resources)} VISA resources:")
+            oscilloscopes = []
+            
+            for i, resource in enumerate(resources, 1):
+                print(f"\n{i}. Testing: {resource}")
+                try:
+                    instr: Any = rm.open_resource(resource)
+                    instr.timeout = 3000
+                    idn = instr.query("*IDN?").strip()
+                    instr.close()
+                    
+                    print(f"   ✓ Identity: {idn}")
+                    
+                    # Check if this is an oscilloscope
+                    if any(keyword in idn.upper() for keyword in ["AGILENT", "KEYSIGHT", "6034A", "MSO", "DSO", "SCOPE"]):
+                        print(f"   ✓ OSCILLOSCOPE DETECTED!")
+                        oscilloscopes.append((resource, idn))
+                    else:
+                        print(f"   - Not an oscilloscope")
+                        
+                except Exception as e:
+                    print(f"   ✗ Connection failed: {e}")
+            
+            self.available_resources = oscilloscopes
+            
+            if oscilloscopes:
+                print(f"\n✓ Found {len(oscilloscopes)} oscilloscope(s):")
+                for i, (resource, idn) in enumerate(oscilloscopes, 1):
+                    print(f"  {i}. {resource}")
+                    print(f"     {idn}")
+                print()
+            else:
+                print("\n✗ No oscilloscopes found!")
+                print("\nTroubleshooting:")
+                print("1. Verify oscilloscope model (MSO/DSO 6000 series)")
+                print("2. Check USB driver installation")
+                print("3. Try different USB port/cable")
+                print("4. Run Agilent Connection Expert")
+            
+            return oscilloscopes
+            
+        except Exception as e:
+            print(f"✗ Discovery failed: {e}")
+            return []
+    
+    def select_oscilloscope(self) -> bool:
+        """
+        Let user select which oscilloscope to connect to
+        
+        Returns:
+            bool: True if selection successful
+        """
+        # Discover available oscilloscopes
+        oscilloscopes = self.discover_oscilloscopes()
+        
+        if not oscilloscopes:
+            return False
+        
+        if len(oscilloscopes) == 1:
+            # Only one oscilloscope found, use it automatically
+            resource, idn = oscilloscopes[0]
+            print(f"✓ Using only available oscilloscope: {resource}")
+            self.resource_string = resource
+            self.scope = AgilentMSO6034A(resource)
+            return True
+        
+        # Multiple oscilloscopes found, let user choose
+        self.print_section("OSCILLOSCOPE SELECTION")
+        print("Multiple oscilloscopes found. Please select one:")
+        
+        for i, (resource, idn) in enumerate(oscilloscopes, 1):
+            print(f"{i}. {resource}")
+            print(f"   {idn}")
+            print()
+        
+        while True:
+            try:
+                choice = input(f"Enter your choice (1-{len(oscilloscopes)}): ").strip()
+                choice_num = int(choice)
+                
+                if 1 <= choice_num <= len(oscilloscopes):
+                    resource, idn = oscilloscopes[choice_num - 1]
+                    print(f"\n✓ Selected: {resource}")
+                    print(f"  Identity: {idn}")
+                    
+                    self.resource_string = resource
+                    self.scope = AgilentMSO6034A(resource)
+                    return True
+                else:
+                    print(f"Invalid choice. Please enter 1-{len(oscilloscopes)}")
+                    
+            except ValueError:
+                print("Invalid input. Please enter a number.")
+            except KeyboardInterrupt:
+                print("\n\nSelection cancelled by user")
+                return False
+        
+    def print_header(self, title: str):
+        """Print a formatted header"""
+        print(f"\n{'='*60}")
+        print(f" {title}")
+        print(f"{'='*60}")
+    
+    def print_section(self, title: str):
+        """Print a formatted section header"""
+        print(f"\n{'-'*40}")
+        print(f" {title}")
+        print(f"{'-'*40}")
+    
+    def safe_execute(self, func, *args, **kwargs):
+        """Safely execute a function and handle errors"""
+        try:
+            result = func(*args, **kwargs)
+            print("✓ Success")
+            return result
+        except Exception as e:
+            print(f"✗ Error: {e}")
+            if "--debug" in sys.argv:
+                traceback.print_exc()
+            return None
+    
+    def test_connection(self):
+        """Test oscilloscope connection and identification"""
+        self.print_header("CONNECTION AND IDENTIFICATION TEST")
+        
+        # If no resource string specified, discover and select oscilloscope
+        if not self.resource_string:
+            print("No resource string specified. Discovering oscilloscopes...")
+            if not self.select_oscilloscope():
+                print("✗ No oscilloscope selected or found")
+                return
+        
+        print(f"Connecting to: {self.resource_string}")
+        result = self.safe_execute(self.scope.connect)
+        
+        if result:
+            self.connected = True
+            print("\nGetting instrument identification...")
+            idn = self.safe_execute(self.scope.get_identification)
+            if idn:
+                for key, value in idn.items():
+                    print(f"  {key}: {value}")
+        
+        return self.connected
+    
+    def test_system_operations(self):
+        """Test basic system operations"""
+        if not self.connected:
+            return False
+            
+        self.print_header("SYSTEM OPERATIONS TEST")
+        
+        print("Testing error clearing...")
+        self.safe_execute(self.scope.clear_errors)
+        
+        print("\nTesting system status query...")
+        status = self.safe_execute(self.scope.get_system_status)
+        if status:
+            print("System Status:")
+            for key, value in list(status.items())[:5]:  # Show first 5 items
+                print(f"  {key}: {value}")
+            if len(status) > 5:
+                print(f"  ... and {len(status)-5} more items")
+        
+        return True
+    
+    def test_channel_configuration(self):
+        """Test channel configuration functions"""
+        if not self.connected:
+            return False
+            
+        self.print_header("CHANNEL CONFIGURATION TEST")
+        
+        test_channel = 1
+        
+        print(f"Testing channel {test_channel} display control...")
+        self.safe_execute(self.scope.set_channel_display, test_channel, True)
+        time.sleep(0.5)
+        
+        print(f"Testing channel {test_channel} vertical scale (1V/div)...")
+        self.safe_execute(self.scope.set_channel_scale, test_channel, 1.0)
+        time.sleep(0.5)
+        
+        print(f"Testing channel {test_channel} offset (0V)...")
+        self.safe_execute(self.scope.set_channel_offset, test_channel, 0.0)
+        time.sleep(0.5)
+        
+        print(f"Testing channel {test_channel} coupling (DC)...")
+        self.safe_execute(self.scope.set_channel_coupling, test_channel, 'DC')
+        time.sleep(0.5)
+        
+        print("\nTesting invalid channel number handling...")
+        result = self.safe_execute(self.scope.set_channel_display, 5, True)  # Should fail
+        if result is None:
+            print("✓ Invalid channel number correctly rejected")
+        
+        print("\nTesting invalid coupling parameter...")
+        result = self.safe_execute(self.scope.set_channel_coupling, test_channel, 'INVALID')
+        if result is None:
+            print("✓ Invalid coupling parameter correctly rejected")
+        
+        return True
+    
+    def test_timebase_configuration(self):
+        """Test timebase configuration functions"""
+        if not self.connected:
+            return False
+            
+        self.print_header("TIMEBASE CONFIGURATION TEST")
+        
+        print("Testing timebase scale (10 microseconds/div)...")
+        self.safe_execute(self.scope.set_timebase_scale, 10e-6)
+        time.sleep(0.5)
+        
+        print("Testing timebase position (0 seconds delay)...")
+        self.safe_execute(self.scope.set_timebase_position, 0.0)
+        time.sleep(0.5)
+        
+        print("Testing different timebase scale (1 millisecond/div)...")
+        self.safe_execute(self.scope.set_timebase_scale, 1e-3)
+        time.sleep(0.5)
+        
+        return True
+    
+    def test_trigger_configuration(self):
+        """Test trigger configuration functions"""
+        if not self.connected:
+            return False
+            
+        self.print_header("TRIGGER CONFIGURATION TEST")
+        
+        print("Testing trigger source (Channel 1)...")
+        self.safe_execute(self.scope.set_trigger_source, 'CHAN1')
+        time.sleep(0.5)
+        
+        print("Testing trigger level (0.0V)...")
+        self.safe_execute(self.scope.set_trigger_level, 0.0)
+        time.sleep(0.5)
+        
+        print("Testing trigger slope (positive edge)...")
+        self.safe_execute(self.scope.set_trigger_slope, 'POS')
+        time.sleep(0.5)
+        
+        print("Testing trigger mode (AUTO)...")
+        self.safe_execute(self.scope.set_trigger_mode, 'AUTO')
+        time.sleep(0.5)
+        
+        print("\nTesting invalid trigger source...")
+        result = self.safe_execute(self.scope.set_trigger_source, 'INVALID')
+        if result is None:
+            print("✓ Invalid trigger source correctly rejected")
+        
+        print("\nTesting invalid trigger slope...")
+        result = self.safe_execute(self.scope.set_trigger_slope, 'INVALID')
+        if result is None:
+            print("✓ Invalid trigger slope correctly rejected")
+        
+        return True
+    
+    def test_acquisition_control(self):
+        """Test acquisition control functions"""
+        if not self.connected:
+            return False
+            
+        self.print_header("ACQUISITION CONTROL TEST")
+        
+        print("Testing RUN command...")
+        self.safe_execute(self.scope.run)
+        time.sleep(1)
+        
+        print("Testing STOP command...")
+        self.safe_execute(self.scope.stop)
+        time.sleep(0.5)
+        
+        print("Testing single trigger...")
+        self.safe_execute(self.scope.single_trigger)
+        time.sleep(1)
+        
+        print("Testing digitize function (channel 1)...")
+        self.safe_execute(self.scope.digitize, [1])
+        
+        return True
+    
+    def test_autoscale(self):
+        """Test autoscale functionality"""
+        if not self.connected:
+            return False
+            
+        self.print_header("AUTOSCALE TEST")
+        
+        print("Testing autoscale on all channels...")
+        self.safe_execute(self.scope.autoscale)
+        
+        print("Waiting for autoscale to complete...")
+        time.sleep(3)
+        
+        print("Testing autoscale on specific channels...")
+        self.safe_execute(self.scope.autoscale, [1, 2])
+        
+        time.sleep(2)
+        
+        return True
+    
+    def test_waveform_acquisition(self):
+        """Test waveform data acquisition"""
+        if not self.connected:
+            return False
+            
+        self.print_header("WAVEFORM DATA ACQUISITION TEST")
+        
+        # First ensure we have a signal to measure
+        print("Setting up for waveform acquisition...")
+        self.safe_execute(self.scope.set_channel_display, 1, True)
+        self.safe_execute(self.scope.set_trigger_mode, 'AUTO')
+        
+        print("Running acquisition...")
+        self.safe_execute(self.scope.run)
+        time.sleep(2)
+        
+        print("Acquiring waveform data from channel 1...")
+        waveform_data = self.safe_execute(self.scope.get_waveform_data, 1, 1000)
+        
+        if waveform_data:
+            print(f"✓ Acquired {waveform_data['points']} data points")
+            print(f"  Time range: {waveform_data['time'][0]:.6f}s to {waveform_data['time'][-1]:.6f}s")
+            print(f"  Voltage range: {np.min(waveform_data['voltage']):.3f}V to {np.max(waveform_data['voltage']):.3f}V")
+            print(f"  Time resolution: {waveform_data['x_increment']:.9f}s")
+            print(f"  Voltage resolution: {waveform_data['y_increment']:.6f}V")
+            
+            # Test plotting if matplotlib is available
+            if MATPLOTLIB_AVAILABLE and plt:
+                try:
+                    plt.figure(figsize=(10, 5))
+                    plt.plot(waveform_data['time'], waveform_data['voltage'], 'b-')
+                    plt.xlabel('Time (s)')
+                    plt.ylabel('Voltage (V)')
+                    plt.title(f'Channel {waveform_data["channel"]} Waveform')
+                    plt.grid(True)
+                    plt.close()
+                except Exception as e:
+                    print(f"✗ Plot error: {e}")
+        
+        return waveform_data is not None
+    
+    def test_measurements(self):
+        """Test automatic measurements"""
+        if not self.connected:
+            return False
+            
+        self.print_header("AUTOMATIC MEASUREMENTS TEST")
+        
+        # Ensure we have a signal to measure
+        print("Setting up measurement conditions...")
+        self.safe_execute(self.scope.set_channel_display, 1, True)
+        self.safe_execute(self.scope.run)
+        time.sleep(2)
+        
+        test_channel = 1
+        
+        print(f"Testing individual measurements on channel {test_channel}...")
+        
+        measurements = ['FREQ', 'VMAX', 'VMIN', 'VPP', 'VRMS']
+        
+        for meas_type in measurements:
+            print(f"  Testing {meas_type} measurement...")
+            result = self.safe_execute(self.scope.get_measurement, meas_type, test_channel)
+            if result is not None:
+                if np.isnan(result):
+                    print(f"    {meas_type}: No valid signal detected")
+                else:
+                    print(f"    {meas_type}: {result}")
+        
+        print(f"\nTesting all measurements at once...")
+        all_measurements = self.safe_execute(self.scope.get_all_measurements, test_channel)
+        if all_measurements:
+            print("All measurements:")
+            for meas_name, value in all_measurements.items():
+                if not np.isnan(value):
+                    print(f"  {meas_name}: {value}")
+                else:
+                    print(f"  {meas_name}: No valid signal")
+        
+        return True
+    
+    def test_screen_capture(self):
+        """Test screen image capture"""
+        if not self.connected:
+            return False
+            
+        self.print_header("SCREEN CAPTURE TEST")
+        
+        print("Testing PNG format screen capture...")
+        filename_png = "scope_screen_test.png"
+        result = self.safe_execute(self.scope.save_screen_image, filename_png, "PNG")
+        
+        if result is not None:
+            if os.path.exists(filename_png):
+                file_size = os.path.getsize(filename_png)
+                print(f"✓ PNG image saved as '{filename_png}' ({file_size} bytes)")
+            else:
+                print(f"✗ PNG file '{filename_png}' was not created")
+        
+        print("\nTesting BMP format screen capture...")
+        filename_bmp = "scope_screen_test.bmp"
+        result = self.safe_execute(self.scope.save_screen_image, filename_bmp, "BMP")
+        
+        if result is not None:
+            if os.path.exists(filename_bmp):
+                file_size = os.path.getsize(filename_bmp)
+                print(f"✓ BMP image saved as '{filename_bmp}' ({file_size} bytes)")
+            else:
+                print(f"✗ BMP file '{filename_bmp}' was not created")
+        
+        print("\nTesting invalid format handling...")
+        result = self.safe_execute(self.scope.save_screen_image, "test.jpg", "JPG")
+        if result is None:
+            print("✓ Invalid format correctly rejected")
+        
+        return True
+    
+    def test_error_conditions(self):
+        """Test error handling and edge cases"""
+        if not self.connected:
+            return False
+            
+        self.print_header("ERROR HANDLING TEST")
+        
+        print("Testing operations on disconnected scope...")
+        # Create a new scope instance that's not connected
+        test_scope = AgilentMSO6034A()
+        
+        result = self.safe_execute(test_scope.write_command, "*IDN?")
+        if result is None:
+            print("✓ Correctly rejected operation on disconnected scope")
+        
+        print("\nTesting invalid SCPI commands...")
+        result = self.safe_execute(self.scope.write_command, ":INVALID:COMMAND")
+        # This might not fail immediately but should be handled by error checking
+        
+        print("\nTesting parameter validation...")
+        
+        # Test invalid channel numbers
+        invalid_channels = [0, 5, -1, 100]
+        for ch in invalid_channels:
+            result = self.safe_execute(self.scope.set_channel_display, ch, True)
+            if result is None:
+                print(f"✓ Invalid channel {ch} correctly rejected")
+        
+        return True
+    
+    def setup_for_data_capture(self, channels: List[int], signal_check: bool = True) -> bool:
+        """
+        Setup oscilloscope for reliable data capture
+        
+        Args:
+            channels: List of channels to prepare
+            signal_check: Whether to check for valid signals
+            
+        Returns:
+            bool: True if setup successful
+        """
+        try:
+            print("Setting up oscilloscope for data capture...")
+            
+            # Enable requested channels, disable others
+            for ch in [1, 2, 3, 4]:
+                enabled = ch in channels
+                self.scope.set_channel_display(ch, enabled)
+                if enabled:
+                    print(f"  ✓ Enabled Channel {ch}")
+            
+            # Set reasonable defaults for enabled channels
+            for ch in channels:
+                try:
+                    # Set reasonable scale and offset
+                    self.scope.set_channel_scale(ch, 1.0)  # 1V/div
+                    self.scope.set_channel_offset(ch, 0.0)  # No offset
+                    self.scope.set_channel_coupling(ch, 'DC')  # DC coupling
+                except Exception as e:
+                    print(f"  ⚠ Warning setting up Channel {ch}: {e}")
+            
+            # Set trigger to first enabled channel
+            if channels:
+                self.scope.set_trigger_source(f'CHAN{channels[0]}')
+                self.scope.set_trigger_level(0.0)
+                self.scope.set_trigger_slope('POS')
+                print(f"  ✓ Set trigger to Channel {channels[0]}")
+            
+            # Note: Timebase will be set by calling function based on duration
+            
+            if signal_check:
+                # Check if there's a signal present
+                print("  Checking for signals...")
+                self.scope.set_trigger_mode('AUTO')
+                self.scope.run()
+                time.sleep(2)
+                
+                # Try to get a simple measurement to verify signal
+                try:
+                    vpp = self.scope.get_measurement('VPP', channels[0])
+                    if vpp and not np.isnan(vpp) and vpp > 0.01:  # At least 10mV
+                        print(f"  ✓ Signal detected on Channel {channels[0]}: {vpp:.3f}V p-p")
+                    else:
+                        print(f"  ⚠ Weak or no signal on Channel {channels[0]}")
+                        print("     Consider connecting a test signal for better results")
+                except Exception:
+                    print("  ⚠ Unable to verify signal presence")
+            
+            return True
+            
+        except Exception as e:
+            print(f"  ✗ Setup failed: {e}")
+            return False
+    
+    def save_waveform_to_csv(self, channels: List[int], filename: str = "", duration_seconds: float = 0.01, points: int = 1000) -> bool:
+        """
+        Capture waveform data and save to CSV file
+        """
+        # User-configurable parameters
+        delimiter = ','  # CSV separator
+        time_unit = 's'  # 's' for seconds, 'ms' for milliseconds
+        float_format = '{:.6f}'  # format for numeric values
+
+        if not self.connected:
+            print("✗ Not connected to oscilloscope")
+            return False
+        
+        # Generate filename if not provided
+        if not filename:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            channels_str = "_".join([f"CH{ch}" for ch in channels])
+            filename = f"waveform_{channels_str}_{timestamp}.csv"
+
+        # Configure timebase to cover duration
+        time_per_div = duration_seconds / 10.0
+        print(f"Setting timebase to {time_per_div*1000:.3f}ms/div for capture")
+        self.scope.set_timebase_scale(time_per_div)
+        self.scope.set_timebase_position(0.0)
+        time.sleep(0.1)
+        
+        # Stop and digitize
+        self.scope.stop()
+        time.sleep(0.1)
+        try:
+            self.scope.digitize(channels)
+        except Exception as e:
+            print(f"✗ Failed to start acquisition: {e}")
+            return False
+
+        # Increase timeout to fetch data
+        original_timeout = self.scope.instrument.timeout
+        self.scope.instrument.timeout = max(10000, int(duration_seconds*5000))
+
+        # Collect waveform for each channel
+        data_dict: Dict[int, List[float]] = {}
+        time_array: List[float] = []  # initialize time array
+        for ch in channels:
+            print(f"Collecting data for Channel {ch}...")
+            try:
+                wf = self.scope.get_waveform_data(ch, points)
+                if wf and isinstance(wf, dict):
+                    # Store time array once when first channel
+                    if not time_array:
+                        time_array = list(wf['time'])
+                    # Store voltage data as list
+                    data_dict[ch] = list(wf['voltage'])
+                    print(f"  ✓ Channel {ch}: {len(wf['voltage'])} points captured")
+                else:
+                    raise Exception("No data returned")
+            except Exception as e:
+                print(f"✗ Error fetching Channel {ch}: {e}")
+                self.scope.instrument.timeout = original_timeout
+                return False
+
+        # Restore original timeout
+        self.scope.instrument.timeout = original_timeout
+
+        # Ensure we have time data before writing CSV
+        if not time_array:
+            print("✗ No waveform data available to write")
+            return False
+
+        # Write CSV with timestamp column
+        print(f"Writing data to {filename}...")
+        # Capture start time (no date) for this acquisition
+        # Use hours:minutes:seconds.milliseconds format
+        start_timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+        try:
+            with open(filename, 'w', newline='') as csvfile:
+                writer = csv.writer(csvfile, delimiter=delimiter)
+                # Header: include absolute timestamp
+                header = ['Timestamp', f"Time [{time_unit}]"] + [f"CH{ch} [V]" for ch in channels]
+                writer.writerow(header)
+                # Rows: iterate by index up to min length of time_array and channel data
+                max_len = len(time_array)
+                for ch, vals in data_dict.items():
+                    max_len = min(max_len, len(vals))
+                for idx in range(max_len):
+                    # Time offset for this data point
+                    t = time_array[idx]
+                    # Prepend capture timestamp and time offset
+                    row = [start_timestamp, float_format.format(t)]
+                    for ch in channels:
+                        vals = data_dict.get(ch, [])
+                        v = vals[idx] if idx < len(vals) else float('nan')
+                        row.append(float_format.format(v))
+                    writer.writerow(row)
+                # Metadata
+                writer.writerow([])
+                writer.writerow(["# Generated:", datetime.now().isoformat()])
+                try:
+                    info = self.scope.get_identification()
+                    writer.writerow(["# Instrument:", info.get('model',''), info.get('serial','')])
+                except:
+                    pass
+            print(f"✓ Waveform CSV saved: {filename}")
+            return True
+        except Exception as e:
+            print(f"✗ Failed saving CSV: {e}")
+            return False
+    
+    def save_measurements_to_csv(self, channels: List[int], filename: str = "", duration_seconds: float = 2.0) -> bool:
+        """
+        Take measurements and save to CSV file
+        
+        Args:
+            channels: List of channel numbers to measure (1-4)
+            filename: Output filename (auto-generated if empty)
+            duration_seconds: How long to let scope stabilize before taking measurements
+            
+        Returns:
+            bool: True if successful
+        """
+        if not self.connected:
+            print("✗ Not connected to oscilloscope")
+            return False
+            
+        self.print_header("MEASUREMENT DATA CSV EXPORT")
+        
+        # Generate filename if not provided
+        if not filename:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            channels_str = "_".join([f"CH{ch}" for ch in channels])
+            filename = f"measurements_{channels_str}_{timestamp}.csv"
+        
+        print(f"Taking measurements for channels: {channels}")
+        print(f"Stabilization time: {duration_seconds}s")
+        print(f"Output file: {filename}")
+        
+        try:
+            # Setup oscilloscope for measurements
+            if not self.setup_for_data_capture(channels, signal_check=True):
+                print("✗ Failed to setup oscilloscope")
+                return False
+            
+            # Start acquisition and let it stabilize
+            self.scope.run()
+            print(f"Letting scope stabilize for {duration_seconds}s...")
+            time.sleep(duration_seconds)
+            
+            # Define measurement types to capture
+            measurement_types = ['VPP', 'VAVG', 'VRMS', 'VMAX', 'VMIN', 'FREQ', 'PER', 'PWID']
+            
+            # Collect measurements for all channels
+            all_measurements = {}
+            
+            for channel in channels:
+                print(f"Measuring Channel {channel}...")
+                channel_measurements = {}
+                
+                # Increase timeout for measurement operations
+                original_timeout = self.scope.instrument.timeout
+                self.scope.instrument.timeout = 8000  # 8 second timeout
+                
+                for meas_type in measurement_types:
+                    try:
+                        result = self.scope.get_measurement(meas_type, channel)
+                        if result is not None and not np.isnan(result):
+                            channel_measurements[meas_type] = result
+                            print(f"  {meas_type}: {result:.6g}")
+                        else:
+                            channel_measurements[meas_type] = "N/A"
+                            print(f"  {meas_type}: N/A (no valid signal)")
+                    except Exception as e:
+                        channel_measurements[meas_type] = "N/A"
+                        print(f"  {meas_type}: N/A (error: {e})")
+                
+                # Restore original timeout
+                self.scope.instrument.timeout = original_timeout
+                
+                all_measurements[f"CH{channel}"] = channel_measurements
+            
+            # Write to CSV file
+            print(f"\nWriting measurements to {filename}...")
+            with open(filename, 'w', newline='') as csvfile:
+                writer = csv.writer(csvfile)
+                
+                # Create header
+                header = ['Measurement']
+                for channel in channels:
+                    header.append(f'CH{channel}')
+                writer.writerow(header)
+                
+                # Write measurement rows
+                for meas_type in measurement_types:
+                    row = [meas_type]
+                    for channel in channels:
+                        ch_key = f"CH{channel}"
+                        if ch_key in all_measurements:
+                            row.append(all_measurements[ch_key][meas_type])
+                        else:
+                            row.append("N/A")
+                    writer.writerow(row)
+                
+                # Add metadata
+                writer.writerow([])
+                writer.writerow(['# Metadata'])
+                writer.writerow(['# Timestamp:', datetime.now().isoformat()])
+                
+                # Get oscilloscope info safely
+                try:
+                    scope_info = self.scope.get_identification()
+                    writer.writerow(['# Oscilloscope:', scope_info.get('model', 'Unknown')])
+                    writer.writerow(['# Serial:', scope_info.get('serial', 'Unknown')])
+                except:
+                    writer.writerow(['# Oscilloscope:', 'MSO6034A'])
+                    writer.writerow(['# Serial:', 'Unknown'])
+                    
+                writer.writerow(['# Channels:', ', '.join([f'CH{ch}' for ch in channels])])
+                
+            print(f"✓ Measurements saved to {filename}")
+            return True
+            
+        except Exception as e:
+            print(f"✗ Failed to save measurements: {e}")
+            if "--debug" in sys.argv:
+                import traceback
+                traceback.print_exc()
+            return False
+    
+    def save_waveform_continuously_to_csv(self, channels: list, total_duration_s: float, sample_interval_s: float, filename: str = "") -> bool:
+        """
+        Continuously capture waveform data and save to a single CSV file.
+
+        Args:
+            channel: Channel to capture
+            total_duration_s: Total duration to capture data for, in seconds.
+            sample_interval_s: How often to sample the waveform, in seconds.
+            filename: Output filename (auto-generated if empty)
+
+        Returns:
+            bool: True if successful
+        """
+        if not self.connected:
+            print("✗ Not connected to oscilloscope")
+            return False
+
+        # Display capture header for all channels
+        channels_str = "_".join([f"CH{ch}" for ch in channels])
+        self.print_header(f"CONTINUOUS WAVEFORM CAPTURE - {channels_str}")
+        print(f"Total Duration: {total_duration_s:.3f}s, Sample Interval: {sample_interval_s:.3f}s")
+
+        if not filename:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"continuous_{channels_str}_{timestamp}.csv"
+        
+        print(f"Output file: {filename}")
+
+        # Setup for acquisition: capture one sample per channel each interval
+        try:
+            self.scope.stop()
+            self.scope.write_command(":WAVEFORM:FORMAT BYTE")
+            self.scope.write_command(":WAVEFORM:POINTS 1")  # single-point capture
+            self.scope.run()
+            time.sleep(0.1)  # allow settings to apply
+        except Exception as e:
+            print(f"✗ Failed to setup oscilloscope: {e}")
+            return False
+
+        capture_count = 0
+        start_time = time.time()
+        end_time = start_time + total_duration_s
+        
+        try:
+            with open(filename, 'w', newline='') as csvfile:
+                writer = csv.writer(csvfile)
+                # Header: Time offset plus one column per channel
+                writer.writerow(['Time [s]'] + [f'CH{ch} [V]' for ch in channels])
+
+                # Continuous capture: one row per interval, one sample per channel
+                while time.time() < end_time:
+                    loop_start = time.time()
+                    # gather one sample per channel
+                    row = []
+                    time_offset = 0.0
+                    for ch in channels:
+                        try:
+                            self.scope.write_command(f":WAVEFORM:SOURCE CHANNEL{ch}")
+                            self.scope.digitize([ch])
+                            times, volts = self.scope.get_waveform_data_continuous(ch)
+                            if times is not None and volts is not None and len(times) > 0:
+                                if row == []:
+                                    time_offset = times[0]
+                                row.append(volts[0])
+                            else:
+                                row.append(float('nan'))
+                        except Exception as e:
+                            print(f"✗ Error capturing CH{ch}: {e}")
+                            row.append(float('nan'))
+                    # write time offset plus voltages
+                    writer.writerow([f"{time_offset:.6f}"] + [f"{v:.6f}" for v in row])
+                    capture_count += 1
+                    # maintain interval timing
+                    elapsed = time.time() - loop_start
+                    if elapsed > sample_interval_s:
+                        print(f"Warning: Loop {capture_count} took {elapsed:.3f}s > interval {sample_interval_s:.3f}s")
+                    time.sleep(max(0, sample_interval_s - elapsed))
+
+            print(f"\n✓ Continuous capture finished. Saved {capture_count} captures to {filename}")
+            return True
+
+        except Exception as e:
+            print(f"✗ Failed during continuous capture: {e}")
+            if "--debug" in sys.argv:
+                traceback.print_exc()
+            return False
+        finally:
+            self.scope.stop()
+
+    def test_csv_export(self):
+        """Test CSV export functionality"""
+        if not self.connected:
+            print("✗ Not connected - please connect first")
+            return False
+            
+        self.print_header("CSV EXPORT TEST")
+        
+        print("This test will capture waveform data and measurements,")
+        print("then save them to CSV files.")
+        print("\nFor best results, connect a test signal to Channel 1")
+        print("(e.g., the oscilloscope's CAL output)")
+        
+        proceed = input("\nProceed with CSV export test? (y/n): ").lower()
+        if not proceed.startswith('y'):
+            print("CSV export test cancelled")
+            return False
+        
+        # Test waveform export
+        print("\n1. Testing waveform data export...")
+        waveform_success = self.save_waveform_to_csv([1])
+        
+        # Test measurements export
+        print("\n2. Testing measurements export...")
+        measurements_success = self.save_measurements_to_csv([1])
+        
+        if waveform_success and measurements_success:
+            print("\n✓ CSV export test completed successfully!")
+            print("Check the current directory for the generated CSV files.")
+            return True
+        else:
+            print("\n✗ CSV export test had some failures")
+            return False
+            
+    def interactive_csv_capture(self):
+        """Interactive CSV data capture menu"""
+        if not self.connected:
+            print("✗ Not connected - please connect first")
+            return
+            
+        while True:
+            self.print_header("INTERACTIVE CSV DATA CAPTURE")
+            
+            print("1. Capture waveform data to CSV")
+            print("2. Capture measurements to CSV")
+            print("3. Capture waveform continuously to CSV")
+            print("4. Capture both waveform and measurements")
+            print("5. Return to main menu")
+            
+            try:
+                choice = input("\nEnter your choice (1-5): ").strip()
+                
+                if choice == "1":
+                    self.capture_waveform_interactive()
+                elif choice == "2":
+                    self.capture_measurements_interactive()
+                elif choice == "3":
+                    self.capture_waveform_continuously_interactive()
+                elif choice == "4":
+                    self.capture_both_interactive()
+                elif choice == "5":
+                    break
+                else:
+                    print("Invalid choice. Please enter 1-5.")
+                    
+                
+            except KeyboardInterrupt:
+                break
+
+    def capture_waveform_interactive(self):
+        """Interactive waveform capture"""
+        print("\n--- Waveform Data Capture ---")
+        
+        # Get channels to capture
+        channels_input = input("Enter channels to capture (1-4, separated by commas) [1]: ").strip()
+        if not channels_input:
+            channels = [1]
+        else:
+            try:
+                channels = [int(ch.strip()) for ch in channels_input.split(',')]
+                channels = [ch for ch in channels if 1 <= ch <= 4]  # Filter valid channels
+                if not channels:
+                    channels = [1]
+            except ValueError:
+                print("Invalid input, using Channel 1")
+                channels = [1]
+        
+        # Get capture duration
+        duration_input = input("Enter capture duration in seconds [0.01]: ").strip()
+        if not duration_input:
+            duration = 0.01  # 10ms default
+        else:
+            try:
+                duration = float(duration_input)
+                if duration <= 0 or duration > 60:  # Limit to reasonable range
+                    print("Duration must be between 0.001 and 60 seconds, using 0.01s")
+                    duration = 0.01
+            except ValueError:
+                print("Invalid duration, using 0.01s")
+                duration = 0.01
+        
+        # Get number of data points
+        points_input = input("Enter number of data points [1000]: ").strip()
+        if not points_input:
+            points = 1000
+        else:
+            try:
+                points = int(points_input)
+                if points < 100 or points > 100000:  # Limit to reasonable range
+                    print("Points must be between 100 and 100000, using 1000")
+                    points = 1000
+            except ValueError:
+                print("Invalid points value, using 1000")
+                points = 1000
+        
+        # Get filename
+        filename = input("Enter filename (leave empty for auto-generated): ").strip()
+        
+        # Capture waveform
+        success = self.save_waveform_to_csv(channels, filename, duration, points)
+        if success:
+            print("✓ Waveform capture completed successfully!")
+        else:
+            print("✗ Waveform capture failed")
+    
+    def capture_waveform_continuously_interactive(self):
+        """Interactive continuous waveform capture."""
+        print("\n--- Continuous Waveform Data Capture ---")
+
+        # Get channels to capture
+        channels_input = input("Enter channels to capture (1-4, separated by commas) [1]: ").strip()
+        if not channels_input:
+            channels = [1]
+        else:
+            try:
+                channels = [int(ch.strip()) for ch in channels_input.split(',')]
+                # filter valid channel numbers
+                channels = [ch for ch in channels if ch in [1, 2, 3, 4]]
+                if not channels:
+                    print("No valid channels entered, using Channel 1.")
+                    channels = [1]
+            except ValueError:
+                print("Invalid input, using Channel 1.")
+                channels = [1]
+
+        def get_duration_from_user(prompt: str, default_val: str) -> float:
+            """Helper to get duration in seconds from user input with units."""
+            while True:
+                user_input = input(prompt).strip()
+                if not user_input:
+                    user_input = default_val
+                
+                time_units = {
+                    'ns': 1e-9, 'us': 1e-6, 'ms': 1e-3, 's': 1, 'm': 60, 'h': 3600
+                }
+                
+                try:
+                    # Find unit if present
+                    unit = next((u for u in time_units if user_input.endswith(u)), 's')
+                    value_str = user_input.removesuffix(unit).strip()
+                    value = float(value_str)
+                    return value * time_units[unit]
+                except ValueError:
+                    print("Invalid format. Please enter a number followed by a unit (ns, us, ms, s, m, h) or just a number for seconds.")
+
+        total_duration_s = get_duration_from_user(
+            "Enter total capture duration (e.g., '10s', '500ms', '2m') [5s]: ", "5s"
+        )
+        
+        sample_interval_s = get_duration_from_user(
+            "Enter sample interval (e.g., '100ms', '0.5s') [100ms]: ", "100ms"
+        )
+
+        if sample_interval_s <= 0.01:
+             print("Warning: Sample intervals below 10ms may not be achievable due to processing overhead.")
+
+        # Get filename
+        filename = input("Enter filename (leave empty for auto-generated): ").strip()
+
+        # Start continuous capture for selected channels
+        success = self.save_waveform_continuously_to_csv(channels, total_duration_s, sample_interval_s, filename)
+        
+        if success:
+            print(f"✓ Continuous waveform capture for channels {channels} completed successfully!")
+        else:
+            print("✗ Continuous waveform capture failed")
+
+    def capture_measurements_interactive(self):
+        """Interactive measurements capture"""
+        print("\n--- Measurements Capture ---")
+        
+        # Get channels to measure
+        channels_input = input("Enter channels to measure (1-4, separated by commas) [1]: ").strip()
+        if not channels_input:
+            channels = [1]
+        else:
+            try:
+                channels = [int(ch.strip()) for ch in channels_input.split(',')]
+                channels = [ch for ch in channels if 1 <= ch <= 4]  # Filter valid channels
+                if not channels:
+                    channels = [1]
+            except ValueError:
+                print("Invalid input, using Channel 1")
+                channels = [1]
+        
+        # Get stabilization duration
+        duration_input = input("Enter stabilization time in seconds [2.0]: ").strip()
+        if not duration_input:
+            duration = 2.0
+        else:
+            try:
+                duration = float(duration_input)
+                if duration < 0.1 or duration > 30:  # Limit to reasonable range
+                    print("Duration must be between 0.1 and 30 seconds, using 2.0s")
+                    duration = 2.0
+            except ValueError:
+                print("Invalid duration, using 2.0s")
+                duration = 2.0
+        
+        # Get filename
+        filename = input("Enter filename (leave empty for auto-generated): ").strip()
+        
+        # Capture measurements
+        success = self.save_measurements_to_csv(channels, filename, duration)
+        if success:
+            print("✓ Measurements capture completed successfully!")
+        else:
+            print("✗ Measurements capture failed")
+    
+    def capture_both_interactive(self):
+        """Interactive capture of both waveform and measurements"""
+        print("\n--- Combined Waveform and Measurements Capture ---")
+        
+        # Get channels
+        channels_input = input("Enter channels to capture (1-4, separated by commas) [1]: ").strip()
+        if not channels_input:
+            channels = [1]
+        else:
+            try:
+                channels = [int(ch.strip()) for ch in channels_input.split(',')]
+                channels = [ch for ch in channels if 1 <= ch <= 4]  # Filter valid channels
+                if not channels:
+                    channels = [1]
+            except ValueError:
+                print("Invalid input, using Channel 1")
+                channels = [1]
+        
+        # Get waveform duration
+        duration_input = input("Enter waveform capture duration in seconds [0.01]: ").strip()
+        if not duration_input:
+            waveform_duration = 0.01
+        else:
+            try:
+                waveform_duration = float(duration_input)
+                if waveform_duration <= 0 or waveform_duration > 60:
+                    print("Duration must be between 0.001 and 60 seconds, using 0.01s")
+                    waveform_duration = 0.01
+            except ValueError:
+                print("Invalid duration, using 0.01s")
+                waveform_duration = 0.01
+        
+        # Get points
+        points_input = input("Enter number of data points [1000]: ").strip()
+        if not points_input:
+            points = 1000
+        else:
+            try:
+                points = int(points_input)
+                if points < 100 or points > 100000:
+                    print("Points must be between 100 and 100000, using 1000")
+                    points = 1000
+            except ValueError:
+                print("Invalid points value, using 1000")
+                points = 1000
+        
+        # Get measurement stabilization time
+        stab_input = input("Enter measurement stabilization time in seconds [2.0]: ").strip()
+        if not stab_input:
+            measurement_duration = 2.0
+        else:
+            try:
+                measurement_duration = float(stab_input)
+                if measurement_duration < 0.1 or measurement_duration > 30:
+                    print("Duration must be between 0.1 and 30 seconds, using 2.0s")
+                    measurement_duration = 2.0
+            except ValueError:
+                print("Invalid duration, using 2.0s")
+                measurement_duration = 2.0
+        
+        # Capture both with timestamp-based filenames
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        channels_str = "_".join([f"CH{ch}" for ch in channels])
+        
+        waveform_file = f"waveform_{channels_str}_{timestamp}.csv"
+        measurements_file = f"measurements_{channels_str}_{timestamp}.csv"
+        
+        print(f"Capturing data for channels: {channels}")
+        
+        # Capture waveform data
+        print("\n1. Capturing waveform data...")
+        waveform_success = self.save_waveform_to_csv(channels, waveform_file, waveform_duration, points)
+        
+        # Capture measurements
+        print("\n2. Capturing measurements...")
+        measurements_success = self.save_measurements_to_csv(channels, measurements_file, measurement_duration)
+        
+        if waveform_success and measurements_success:
+            print("\n✓ Combined capture completed successfully!")
+            print(f"  Waveform data: {waveform_file}")
+            print(f"  Measurements: {measurements_file}")
+        else:
+            print("\n✗ Some captures failed")
+    
+    def run_comprehensive_test(self):
+        """Run all tests in sequence"""
+        self.print_header("AGILENT MSO6034A COMPREHENSIVE TEST SUITE")
+        print("Starting comprehensive test of all oscilloscope functions...")
+        print("\nNote: This test requires a physical oscilloscope connection.")
+        print("Some tests may show 'No valid signal' if no input signal is connected.")
+        
+        test_results = {}
+        
+        # Connection test (required for all others)
+        test_results['connection'] = self.test_connection()
+        if not test_results['connection']:
+            print("\n❌ Connection failed - cannot proceed with other tests")
+            return test_results
+        
+        # System operations
+        test_results['system'] = self.test_system_operations()
+        
+        # Configuration tests
+        test_results['channels'] = self.test_channel_configuration()
+        test_results['timebase'] = self.test_timebase_configuration()
+        test_results['trigger'] = self.test_trigger_configuration()
+        
+        # Acquisition tests
+        test_results['acquisition'] = self.test_acquisition_control()
+        test_results['autoscale'] = self.test_autoscale()
+        
+        # Data acquisition and measurement tests
+        test_results['waveform'] = self.test_waveform_acquisition()
+        test_results['measurements'] = self.test_measurements()
+        
+        # Additional features
+        test_results['screen_capture'] = self.test_screen_capture()
+        test_results['csv_export'] = self.test_csv_export()
+        test_results['error_handling'] = self.test_error_conditions()
+        
+        # Print summary
+        self.print_test_summary(test_results)
+        
+        return test_results
+    
+    def print_test_summary(self, results: Dict[str, bool]):
+        """Print a summary of test results"""
+        self.print_header("TEST SUMMARY")
+        
+        passed = sum(1 for result in results.values() if result)
+        total = len(results)
+        
+        print(f"Tests passed: {passed}/{total}")
+        print("")
+        
+        for test_name, result in results.items():
+            status = "✓ PASS" if result else "✗ FAIL"
+            print(f"{test_name.upper():20} {status}")
+        
+        if passed == total:
+            print(f"\n🎉 All tests passed! The oscilloscope interface is working correctly.")
+        elif passed > 0:
+            print(f"\n⚠️  Some tests failed. Check connections and instrument status.")
+        else:
+            print(f"\n❌ All tests failed. Check instrument connection and configuration.")
+    
+    def interactive_mode(self):
+        """Run in interactive mode with menu"""
+        while True:
+            self.print_header("AGILENT MSO6034A INTERACTIVE TEST MENU")
+            print("1.  Discover Oscilloscopes")
+            print("2.  Test Connection")
+            print("3.  Test System Operations")
+            print("4.  Test Channel Configuration")
+            print("5.  Test Timebase Configuration")
+            print("6.  Test Trigger Configuration")
+            print("7.  Test Acquisition Control")
+            print("8.  Test Autoscale")
+            print("9.  Test Waveform Acquisition")
+            print("10. Test Measurements")
+            print("11. Test Screen Capture")
+            print("12. Test Error Handling")
+            print("13. CSV Data Capture")
+            print("14. Test CSV Export")
+            print("15. Run ALL Tests")
+            print("16. System Status")
+            print("0.  Exit")
+            
+            try:
+                choice = input("\nEnter your choice (0-16): ").strip()
+                
+                if choice == '0':
+                    break
+                elif choice == '1':
+                    self.select_oscilloscope()
+                elif choice == '2':
+                    self.test_connection()
+                elif choice == '3':
+                    self.test_system_operations()
+                elif choice == '4':
+                    self.test_channel_configuration()
+                elif choice == '5':
+                    self.test_timebase_configuration()
+                elif choice == '6':
+                    self.test_trigger_configuration()
+                elif choice == '7':
+                    self.test_acquisition_control()
+                elif choice == '8':
+                    self.test_autoscale()
+                elif choice == '9':
+                    self.test_waveform_acquisition()
+                elif choice == '10':
+                    self.test_measurements()
+                elif choice == '11':
+                    self.test_screen_capture()
+                elif choice == '12':
+                    self.test_error_conditions()
+                elif choice == '13':
+                    self.interactive_csv_capture()
+                elif choice == '14':
+                    self.test_csv_export()
+                elif choice == '15':
+                    self.run_comprehensive_test()
+                elif choice == '16':
+                    if self.connected:
+                        status = self.safe_execute(self.scope.get_system_status)
+                        if status:
+                            self.print_section("SYSTEM STATUS")
+                            for key, value in status.items():
+                                print(f"{key}: {value}")
+                    else:
+                        print("Not connected to oscilloscope")
+                else:
+                    print("Invalid choice. Please select 0-13.")
+                    
+                
+            except KeyboardInterrupt:
+                print("\n\nExiting...")
+                break
+            except Exception as e:
+                print(f"Error: {e}")
+    
+    def cleanup(self):
+        """Clean up resources"""
+        if self.scope:
+            self.scope.disconnect()
+
+
+def main():
+    """Main function"""
+    print("Agilent MSO6034A Oscilloscope Test Driver")
+    print("==========================================")
+    print("Enhanced Interactive Test Suite with CSV Data Export")
+    print("\nCommand line options:")
+    print("  --debug      : Show detailed error traces")
+    print("  --auto       : Run all tests automatically")
+    print("  --interactive: Run in interactive menu mode")
+    print("  --resource <string> : Use specific VISA resource string")
+    print("  --discover   : Discover and select oscilloscope")
+    print("")
+    print("Features:")
+    print("  • Automatic oscilloscope discovery and selection")
+    print("  • Interactive CSV data capture")
+    print("  • Waveform data export to CSV")
+    print("  • Automated measurements export to CSV")
+    print("  • Comprehensive testing suite")
+    print("")
+    
+    # Parse resource string if provided
+    resource_string = ""
+    if "--resource" in sys.argv:
+        try:
+            resource_index = sys.argv.index("--resource")
+            if resource_index + 1 < len(sys.argv):
+                resource_string = sys.argv[resource_index + 1]
+                print(f"Using resource string: {resource_string}")
+            else:
+                print("Error: --resource requires a resource string")
+                return
+        except ValueError:
+            pass
+    
+    driver = AgilentTestDriver(resource_string)
+    
+    try:
+        if "--discover" in sys.argv:
+            # Discover and select oscilloscope
+            print("Discovering oscilloscopes...")
+            if driver.select_oscilloscope():
+                print("\nOscilloscope selected. Starting interactive mode...")
+                driver.interactive_mode()
+            else:
+                print("No oscilloscope selected.")
+        elif "--auto" in sys.argv:
+            # Run all tests automatically
+            driver.run_comprehensive_test()
+        elif "--interactive" in sys.argv or len(sys.argv) == 1 or resource_string:
+            # Run in interactive mode
+            driver.interactive_mode()
+        else:
+            print("Unknown option. Use --auto, --interactive, or no arguments for interactive mode.")
+    
+    except KeyboardInterrupt:
+        print("\n\nInterrupted by user")
+    except Exception as e:
+        print(f"\nUnexpected error: {e}")
+        if "--debug" in sys.argv:
+            traceback.print_exc()
+    finally:
+        driver.cleanup()
+        print("\nTest driver finished.")
+
+
+if __name__ == "__main__":
+    main()
