@@ -1,0 +1,684 @@
+Agilent MSO6034A Oscilloscope Data Collection Module
+
+This module provides a Python interface for controlling and collecting data from
+an Agilent MSO6034A Mixed Signal Oscilloscope via VISA/SCPI commands.
+
+Compatible with:
+- Agilent InfiniiVision 6000 Series Oscilloscopes
+- VISA communication protocols (USB, LAN, GPIB)
+
+Requirements:
+- pyvisa library
+- numpy library (for waveform data processing)
+
+Author: Automation Testing Scripts
+Date: July 25, 2025
+Version: 1.0
+Status: Stable
+"""
+
+import pyvisa
+import numpy as np
+import struct
+import time
+from typing import List, Dict, Tuple, Optional, Union, Any
+
+
+def check_visa_backends():
+    """
+    Check available VISA backends and return information about them.
+    
+    Returns:
+        dict: Dictionary with backend information
+    """
+    backends = {}
+    
+    # Check default backend
+    try:
+        rm = pyvisa.ResourceManager()
+        backends['default'] = {'available': True, 'error': None}
+        rm.close()
+    except Exception as e:
+        backends['default'] = {'available': False, 'error': str(e)}
+    
+    # Check PyVISA-py backend
+    try:
+        rm = pyvisa.ResourceManager('@py')
+        backends['pyvisa-py'] = {'available': True, 'error': None}
+        rm.close()
+    except Exception as e:
+        backends['pyvisa-py'] = {'available': False, 'error': str(e)}
+    
+    return backends
+
+
+def print_visa_backend_info():
+    """Print information about available VISA backends."""
+    print("VISA Backend Information:")
+    print("-" * 40)
+    backends = check_visa_backends()
+    
+    for backend_name, info in backends.items():
+        status = "✓ Available" if info['available'] else "✗ Not Available"
+        print(f"{backend_name:12}: {status}")
+        if not info['available']:
+            print(f"             Error: {info['error']}")
+    print("-" * 40)
+
+
+class AgilentMSO6034A:
+    """
+    Interface class for Agilent MSO6034A Mixed Signal Oscilloscope
+    
+    This class provides methods for:
+    - Connecting to the oscilloscope
+    - Configuring channels, timebase, and trigger settings
+    - Acquiring waveform data
+    - Performing measurements
+    - System configuration
+    """
+    
+    # Resource manager and instrument handle are set in __init__
+    rm: pyvisa.ResourceManager
+    instrument: Any
+    def __init__(self, resource_string: Optional[str] = None, timeout: int = 5000, visa_backend: Optional[str] = None):
+        """
+        Initialize the oscilloscope interface
+        
+        Args:
+            resource_string: VISA resource string (e.g., 'USB0::0x0957::0x1796::MY12345678::INSTR')
+            timeout: Communication timeout in milliseconds
+            visa_backend: VISA backend to use ('default', 'pyvisa-py', or None for auto-detect)
+        """
+        self.resource_string = resource_string
+        self.timeout = timeout
+        self.instrument: Any = None
+        # Initialize VISA resource manager
+        self.connected = False
+        self.channels = [1, 2, 3, 4]  # MSO6034A has 4 analog channels
+        self.digital_channels = list(range(16))  # D0-D15
+        
+        # Initialize VISA Resource Manager with specified or auto-detected backend
+        if visa_backend == 'pyvisa-py':
+            # Force PyVISA-py backend
+            try:
+                self.rm = pyvisa.ResourceManager('@py')
+                print("Using PyVISA-py backend (pure Python implementation)")
+            except Exception as e:
+                raise Exception(f"Failed to initialize PyVISA-py backend: {e}")
+        elif visa_backend == 'default':
+            # Force default backend
+            try:
+                self.rm = pyvisa.ResourceManager()
+                print("Using default VISA backend")
+            except Exception as e:
+                raise Exception(f"Failed to initialize default VISA backend: {e}\n"
+                               f"You may need to install VISA runtime libraries or use PyVISA-py backend.")
+        else:
+            # Auto-detect: try default first, then PyVISA-py
+            try:
+                self.rm = pyvisa.ResourceManager()
+                print("Using default VISA backend")
+            except Exception as e:
+                try:
+                    print(f"Warning: Default VISA backend failed ({e})")
+                    print("Attempting to use PyVISA-py backend...")
+                    self.rm = pyvisa.ResourceManager('@py')
+                    print("Successfully initialized PyVISA-py backend")
+                except Exception as e2:
+                    print("\nVISA Backend Information:")
+                    print_visa_backend_info()
+                    raise Exception(f"Failed to initialize VISA Resource Manager with both default and PyVISA-py backends.\n"
+                                   f"Default backend error: {e}\n"
+                                   f"PyVISA-py backend error: {e2}\n"
+                                   f"Please install VISA runtime or check PyVISA-py installation.")
+    
+    def connect(self, resource_string: Optional[str] = None) -> bool:
+        """
+        Connect to the oscilloscope
+        
+        Args:
+            resource_string: VISA resource string (optional if set during init)
+            
+        Returns:
+            bool: True if connection successful
+        """
+        if resource_string:
+            self.resource_string = resource_string
+            
+        if not self.resource_string:
+            # Auto-detect if no resource string provided
+            self.resource_string = self._auto_detect_instrument()
+            
+        if not self.resource_string:
+            raise Exception("No oscilloscope found. Please specify resource_string or connect instrument.")
+            
+        try:
+            # Ensure resource_string is valid for open_resource
+            assert isinstance(self.resource_string, str) and self.resource_string, \
+                "No resource string specified"
+            self.instrument = self.rm.open_resource(self.resource_string)
+            self.instrument.timeout = self.timeout
+            
+            # Test connection with identification query
+            idn = self.instrument.query("*IDN?").strip()
+            print(f"Connected to: {idn}")
+            
+            # Verify it's a compatible instrument
+            if "6034A" not in idn or "Agilent" not in idn:
+                print(f"Warning: Connected instrument may not be MSO6034A: {idn}")
+            
+            self.connected = True
+            
+            # Clear any errors and reset instrument
+            self.clear_errors()
+            
+            return True
+            
+        except Exception as e:
+            raise Exception(f"Failed to connect to oscilloscope: {e}")
+    
+    def _auto_detect_instrument(self) -> Optional[str]:
+        """
+        Auto-detect Agilent oscilloscope on available interfaces
+        
+        Returns:
+            str: Resource string if found, None otherwise
+        """
+        try:
+            resources = self.rm.list_resources()
+            for resource in resources:
+                try:
+                    temp_instr: Any = self.rm.open_resource(resource)
+                    temp_instr.timeout = 2000
+                    idn = temp_instr.query("*IDN?").strip()  # type: ignore
+                    temp_instr.close()  # type: ignore
+                    if "Agilent" in idn and "60" in idn:  # Look for 6000 series
+                        print(f"Auto-detected oscilloscope: {idn}")
+                        return resource
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        return None
+    
+    def disconnect(self):
+        """Disconnect from the oscilloscope"""
+        if self.instrument:
+            try:
+                self.instrument.close()
+            except:
+                pass
+            self.instrument = None
+        self.connected = False
+    
+    def write_command(self, command: str):
+        """
+        Send a SCPI command to the oscilloscope
+        
+        Args:
+            command: SCPI command string
+        """
+        if not self.connected:
+            raise Exception("Oscilloscope not connected")
+        try:
+            self.instrument.write(command)
+        except Exception as e:
+            raise Exception(f"Failed to write command '{command}': {e}")
+    
+    def query(self, command: str) -> str:
+        """
+        Send a SCPI query and return response
+        
+        Args:
+            command: SCPI query string
+            
+        Returns:
+            str: Response from oscilloscope
+        """
+        if not self.connected:
+            raise Exception("Oscilloscope not connected")
+        try:
+            response = self.instrument.query(command).strip()
+            return response
+        except Exception as e:
+            raise Exception(f"Failed to query '{command}': {e}")
+    
+    def clear_errors(self):
+        """Clear any error conditions"""
+        try:
+            # Clear error queue
+            for _ in range(10):  # Clear up to 10 errors
+                error = self.query(":SYSTEM:ERROR?")
+                if "No error" in error:
+                    break
+        except:
+            pass
+    
+    def get_identification(self) -> Dict[str, str]:
+        """
+        Get instrument identification information
+        
+        Returns:
+            dict: Identification information (manufacturer, model, serial, firmware)
+        """
+        idn = self.query("*IDN?")
+        parts = idn.split(',')
+        
+        return {
+            'manufacturer': parts[0] if len(parts) > 0 else '',
+            'model': parts[1] if len(parts) > 1 else '',
+            'serial': parts[2] if len(parts) > 2 else '',
+            'firmware': parts[3] if len(parts) > 3 else ''
+        }
+    
+    def reset_instrument(self):
+        """Reset instrument to default state"""
+        self.write_command("*RST")
+        time.sleep(3)  # Allow time for reset
+        self.clear_errors()
+    
+    def autoscale(self, channels: Optional[List[int]] = None):
+        """
+        Perform autoscale on specified channels
+        
+        Args:
+            channels: List of channel numbers to autoscale (None for all active)
+        """
+        if channels:
+            # Enable only specified channels for autoscale
+            for ch in [1, 2, 3, 4]:
+                if ch in channels:
+                    self.write_command(f":CHANNEL{ch}:DISPLAY ON")
+                else:
+                    self.write_command(f":CHANNEL{ch}:DISPLAY OFF")
+        
+        self.write_command(":AUTOSCALE")
+        time.sleep(2)  # Allow time for autoscale to complete
+    
+    def set_channel_display(self, channel: int, enabled: bool):
+        """
+        Enable or disable channel display
+        
+        Args:
+            channel: Channel number (1-4)
+            enabled: True to enable, False to disable
+        """
+        if channel not in [1, 2, 3, 4]:
+            raise ValueError("Channel must be 1, 2, 3, or 4")
+            
+        state = "ON" if enabled else "OFF"
+        self.write_command(f":CHANNEL{channel}:DISPLAY {state}")
+    
+    def set_channel_scale(self, channel: int, volts_per_div: float):
+        """
+        Set channel vertical scale (volts/division)
+        
+        Args:
+            channel: Channel number (1-4)
+            volts_per_div: Vertical scale in volts per division
+        """
+        if channel not in [1, 2, 3, 4]:
+            raise ValueError("Channel must be 1, 2, 3, or 4")
+            
+        self.write_command(f":CHANNEL{channel}:SCALE {volts_per_div}")
+    
+    def set_channel_offset(self, channel: int, offset_volts: float):
+        """
+        Set channel vertical offset
+        
+        Args:
+            channel: Channel number (1-4)
+            offset_volts: Offset in volts
+        """
+        if channel not in [1, 2, 3, 4]:
+            raise ValueError("Channel must be 1, 2, 3, or 4")
+            
+        self.write_command(f":CHANNEL{channel}:OFFSET {offset_volts}")
+    
+    def set_channel_coupling(self, channel: int, coupling: str):
+        """
+        Set channel input coupling
+        
+        Args:
+            channel: Channel number (1-4)
+            coupling: 'AC', 'DC', or 'GND'
+        """
+        if channel not in [1, 2, 3, 4]:
+            raise ValueError("Channel must be 1, 2, 3, or 4")
+            
+        if coupling is None or coupling.upper() not in ['AC', 'DC', 'GND']:
+            raise ValueError("Coupling must be 'AC', 'DC', or 'GND'")
+            
+        self.write_command(f":CHANNEL{channel}:COUPLING {coupling.upper()}")
+    
+    def set_timebase_scale(self, seconds_per_div: float):
+        """
+        Set horizontal timebase scale
+        
+        Args:
+            seconds_per_div: Time per division in seconds
+        """
+        self.write_command(f":TIMEBASE:SCALE {seconds_per_div}")
+    
+    def set_timebase_position(self, position_seconds: float):
+        """
+        Set horizontal timebase position (delay)
+        
+        Args:
+            position_seconds: Time position in seconds (negative for pre-trigger)
+        """
+        self.write_command(f":TIMEBASE:POSITION {position_seconds}")
+    
+    def set_trigger_source(self, source: str):
+        """
+        Set trigger source
+        
+        Args:
+            source: Trigger source ('CHAN1', 'CHAN2', 'CHAN3', 'CHAN4', 'EXT', 'LINE')
+        """
+        valid_sources = ['CHAN1', 'CHAN2', 'CHAN3', 'CHAN4', 'EXT', 'LINE']
+        if source is None or source.upper() not in valid_sources:
+            raise ValueError(f"Source must be one of: {valid_sources}")
+            
+        self.write_command(f":TRIGGER:SOURCE {source.upper()}")
+    
+    def set_trigger_level(self, level_volts: float):
+        """
+        Set trigger level
+        
+        Args:
+            level_volts: Trigger level in volts
+        """
+        self.write_command(f":TRIGGER:LEVEL {level_volts}")
+    
+    def set_trigger_slope(self, slope: str):
+        """
+        Set trigger slope
+        
+        Args:
+            slope: 'POS' (positive/rising) or 'NEG' (negative/falling)
+        """
+        if slope is None or slope.upper() not in ['POS', 'NEG', 'POSITIVE', 'NEGATIVE']:
+            raise ValueError("Slope must be 'POS' or 'NEG'")
+            
+        slope = 'POS' if slope.upper() in ['POS', 'POSITIVE'] else 'NEG'
+        self.write_command(f":TRIGGER:SLOPE {slope}")
+    
+    def set_trigger_mode(self, mode: str):
+        """
+        Set trigger mode
+        
+        Args:
+            mode: 'AUTO', 'NORM' (normal), or 'SINGLE'
+        """
+        valid_modes = ['AUTO', 'NORM', 'NORMAL', 'SINGLE']
+        if mode is None or mode.upper() not in valid_modes:
+            raise ValueError(f"Mode must be one of: {valid_modes}")
+            
+        mode = 'NORM' if mode.upper() in ['NORM', 'NORMAL'] else mode.upper()
+        self.write_command(f":TRIGGER:MODE {mode}")
+    
+    def single_trigger(self):
+        """Force a single trigger acquisition"""
+        self.write_command(":SINGLE")
+    
+    def run(self):
+        """Start continuous acquisition"""
+        self.write_command(":RUN")
+    
+    def stop(self):
+        """Stop acquisition"""
+        self.write_command(":STOP")
+    
+    def digitize(self, channels: Optional[List[int]] = None):
+        """
+        Digitize specified channels (acquire waveform data)
+        
+        Args:
+            channels: List of channel numbers to digitize (None for all enabled)
+        """
+        if channels is None:
+            self.write_command(":DIGITIZE")
+        elif len(channels) == 1:
+            self.write_command(f":DIGITIZE CHANNEL{channels[0]}")
+        else:
+            ch_list = ','.join([f"CHANNEL{ch}" for ch in channels])
+            self.write_command(f":DIGITIZE {ch_list}")
+        
+        # Wait for acquisition to complete
+        self._wait_for_operation_complete()
+    
+    def _wait_for_operation_complete(self, timeout: int = 10):
+        """
+        Wait for operation to complete using *OPC query
+        
+        Args:
+            timeout: Timeout in seconds
+        """
+        start_time = time.time()
+        while time.time() - start_time < timeout:
+            try:
+                opc = self.query("*OPC?")
+                if opc.strip() == "1":
+                    return
+            except:
+                pass
+            time.sleep(0.1)
+        
+        print("Warning: Operation may not have completed within timeout")
+    
+    def get_waveform_data(self, channel: int, points: int = 1000) -> Dict:
+        """
+        Get waveform data from specified channel
+        
+        Args:
+            channel: Channel number (1-4)
+            points: Number of points to retrieve
+            
+        Returns:
+            dict: Waveform data with time/voltage arrays and metadata
+        """
+        if channel not in [1, 2, 3, 4]:
+            raise ValueError("Channel must be 1, 2, 3, or 4")
+        
+        # Set waveform source and parameters
+        self.write_command(f":WAVEFORM:SOURCE CHANNEL{channel}")
+        self.write_command(":WAVEFORM:FORMAT BYTE")
+        self.write_command(f":WAVEFORM:POINTS {points}")
+        
+        # Get waveform preamble (scaling information)
+        preamble = self.query(":WAVEFORM:PREAMBLE?")
+        preamble_parts = preamble.split(',')
+        
+        # Extract scaling parameters
+        x_increment = float(preamble_parts[4])  # Time per point
+        x_origin = float(preamble_parts[5])     # Time of first point
+        x_reference = int(preamble_parts[6])    # Reference point index
+        y_increment = float(preamble_parts[7])  # Volts per LSB
+        y_origin = float(preamble_parts[8])     # Voltage at center screen
+        y_reference = int(preamble_parts[9])    # Reference point value
+        
+        # Get raw waveform data
+        self.instrument.write(":WAVEFORM:DATA?")
+        raw_data = self.instrument.read_raw()
+        
+        # Parse IEEE 488.2 definite length block
+        header_len = 2 + int(chr(raw_data[1]))
+        data_bytes = raw_data[header_len:-1]  # Remove header and terminator
+        
+        # Convert to numpy array
+        waveform_data = np.frombuffer(data_bytes, dtype=np.uint8)
+        
+        # Scale the data to voltage values
+        voltage = (waveform_data - y_reference) * y_increment + y_origin
+        
+        # Create time array
+        time_array = (np.arange(len(voltage)) - x_reference) * x_increment + x_origin
+        
+        return {
+            'time': time_array,
+            'voltage': voltage,
+            'channel': channel,
+            'points': len(voltage),
+            'x_increment': x_increment,
+            'y_increment': y_increment,
+            'x_origin': x_origin,
+            'y_origin': y_origin
+        }
+    
+    def get_waveform_data_continuous(self, channel: int) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+        """
+        Get waveform data from specified channel, optimized for continuous capture.
+        This method assumes that waveform source and format are already set.
+        
+        Args:
+            channel: Channel number (1-4)
+            
+        Returns:
+            Tuple[Optional[np.ndarray], Optional[np.ndarray]]: time_array, voltage_array
+        """
+        try:
+            # Get waveform preamble (scaling information)
+            preamble = self.query(":WAVEFORM:PREAMBLE?")
+            preamble_parts = preamble.split(',')
+            
+            # Extract scaling parameters
+            x_increment = float(preamble_parts[4])
+            x_origin = float(preamble_parts[5])
+            x_reference = int(preamble_parts[6])
+            y_increment = float(preamble_parts[7])
+            y_origin = float(preamble_parts[8])
+            y_reference = int(preamble_parts[9])
+            
+            # Get raw waveform data
+            self.instrument.write(":WAVEFORM:DATA?")
+            raw_data = self.instrument.read_raw()
+            
+            # Parse IEEE 488.2 definite length block
+            header_len = 2 + int(chr(raw_data[1]))
+            data_bytes = raw_data[header_len:-1]
+            
+            # Convert to numpy array
+            waveform_data = np.frombuffer(data_bytes, dtype=np.uint8)
+            
+            # Scale the data to voltage values
+            voltage = (waveform_data - y_reference) * y_increment + y_origin
+            
+            # Create time array
+            time_array = (np.arange(len(voltage)) - x_reference) * x_increment + x_origin
+            
+            return time_array, voltage
+            
+        except Exception:
+            return None, None
+
+    def get_measurement(self, measurement_type: str, channel: int) -> float:
+        """
+        Get automatic measurement from specified channel
+        
+        Args:
+            measurement_type: Type of measurement (e.g., 'FREQ', 'VMAX', 'VMIN', 'VPP', 'VAVG', 'VRMS')
+            channel: Channel number (1-4)
+            
+        Returns:
+            float: Measurement value
+        """
+        if channel not in [1, 2, 3, 4]:
+            raise ValueError("Channel must be 1, 2, 3, or 4")
+        
+        # Set measurement source
+        self.write_command(f":MEASURE:SOURCE CHANNEL{channel}")
+        
+        # Get measurement
+        result = self.query(f":MEASURE:{measurement_type.upper()}?")
+        
+        try:
+            return float(result)
+        except ValueError:
+            # Handle special cases like "OVER RANGE" or "INVALID"
+            return float('nan')
+    
+    def get_all_measurements(self, channel: int) -> Dict[str, float]:
+        """
+        Get all common measurements from specified channel
+        
+        Args:
+            channel: Channel number (1-4)
+            
+        Returns:
+            dict: Dictionary of measurement values
+        """
+        measurements = {}
+        measurement_types = ['FREQ', 'PERIOD', 'VMAX', 'VMIN', 'VPP', 'VAVG', 'VRMS', 'RISE', 'FALL']
+        
+        for meas_type in measurement_types:
+            try:
+                measurements[meas_type.lower()] = self.get_measurement(meas_type, channel)
+            except Exception:
+                measurements[meas_type.lower()] = float('nan')
+        
+        return measurements
+    
+    def save_screen_image(self, filename: str, format_type: str = "PNG"):
+        """
+        Save screen image to file
+        
+        Args:
+            filename: Output filename
+            format_type: Image format ('PNG', 'BMP')
+        """
+        if format_type.upper() not in ['PNG', 'BMP']:
+            raise ValueError("Format must be 'PNG' or 'BMP'")
+        
+        # Set image format
+        self.write_command(f":HARDCOPY:FORMAT {format_type.upper()}")
+        
+        # Get image data
+        self.instrument.write(":HARDCOPY:DATA?")
+        image_data = self.instrument.read_raw()
+        
+        # Remove IEEE block header and write to file
+        header_len = 2 + int(chr(image_data[1]))
+        with open(filename, 'wb') as f:
+            f.write(image_data[header_len:-1])
+    
+    def get_system_status(self) -> Dict[str, str]:
+        """
+        Get system status information
+        
+        Returns:
+            dict: System status information
+        """
+        status = {}
+        
+        try:
+            # Get various status information
+            status['trigger_mode'] = self.query(":TRIGGER:MODE?")
+            status['trigger_source'] = self.query(":TRIGGER:SOURCE?")
+            status['trigger_level'] = self.query(":TRIGGER:LEVEL?")
+            status['timebase_scale'] = self.query(":TIMEBASE:SCALE?")
+            status['timebase_position'] = self.query(":TIMEBASE:POSITION?")
+            
+            # Get channel information
+            for ch in [1, 2, 3, 4]:
+                try:
+                    status[f'ch{ch}_display'] = self.query(f":CHANNEL{ch}:DISPLAY?")
+                    status[f'ch{ch}_scale'] = self.query(f":CHANNEL{ch}:SCALE?")
+                    status[f'ch{ch}_offset'] = self.query(f":CHANNEL{ch}:OFFSET?")
+                    status[f'ch{ch}_coupling'] = self.query(f":CHANNEL{ch}:COUPLING?")
+                except:
+                    pass
+                    
+        except Exception as e:
+            status['error'] = str(e)
+        
+        return status
+    
+    def __enter__(self):
+        """Context manager entry"""
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Context manager exit"""
+        self.disconnect()
